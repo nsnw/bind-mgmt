@@ -26,6 +26,8 @@ DEFAULT_CACHE="1h"
 SQLITE="/usr/bin/sqlite3"
 DB="bind-mgmt.db"
 RNDC="/usr/sbin/rndc"
+SIPCALC="/usr/bin/sipcalc"
+HOST="/usr/bin/host"
 
 if [ ! -f ${RNDC} ]; then
   error "Cannot find ${FCCYN}${RNDC}${CLR}. Is bind installed?"
@@ -62,6 +64,18 @@ function call_sqlite {
     done
 		return ${ERR}
 	fi
+}
+
+function call_sipcalc {
+  if [ ! -z "$1" ]; then
+    QUERY="$1"
+    debug ${FUNCNAME} "sipcalc: called with '${FCYLW}${QUERY}${CLR}'"
+    OUTPUT=`${SIPCALC} ${QUERY} 2>&1`
+    ERR=$?
+
+    echo ${OUTPUT}
+    return ${ERR}
+  fi
 }
 
 function init_db {
@@ -1621,7 +1635,7 @@ function generate_zone {
       echo -e "
 \$ORIGIN ${ZONE}.
 \$TTL ${TTL}
-${ZONE}.\t\tIN\tSOA\t${AUTH}. ${CONTACT}. (
+${ZONE}.\t\tIN\tSOA\t${AUTH} ${CONTACT} (
 \t\t\t${SERIAL}
 \t\t\t${REFRESH}
 \t\t\t${RETRY}
@@ -1656,6 +1670,200 @@ ${ZONE}.\t\tIN\tSOA\t${AUTH}. ${CONTACT}. (
       fi
 
     fi
+  fi
+}
+
+function convert_ip_to_rev {
+  if [ -z "$1" ]; then
+    error "Missing IP argument to convert_ip_to_rev."
+    return 255
+  else
+
+    IP=$1
+    debug ${FUNCNAME} "IP passed is ${FCCYN}${IP}${CLR}."
+
+    IP_PARTS=( `echo ${IP} | sed -e 's/\./ /g'` )
+
+    REV="${IP_PARTS[3]}.${IP_PARTS[2]}.${IP_PARTS[1]}.${IP_PARTS[0]}.in-addr.arpa"
+    debug ${FUNCNAME} "in-addr.arpa format is ${FCCYN}${REV}${CLR}."
+    echo ${REV}
+  fi
+}
+
+function convert_ip6_to_rev {
+  if [ -z "$1" ]; then
+    error "Missing IP argument to convert_ip6_to_rev."
+    return 255
+  else
+
+    IP=$1
+    debug ${FUNCNAME} "IP passed is ${FCCYN}${IP}${CLR}."
+
+    REV="`${SIPCALC} -r ${IP} | grep \"ip6.arpa.\$\"`"
+    debug ${FUNCNAME} "in-addr.arpa format is ${FCCYN}${REV}${CLR}."
+    echo ${REV}
+  fi
+}
+
+function import_zone {
+  if [ -z "$1" ]; then
+    error "Missing zone argument to import_zone."
+    return 255
+  else
+
+    if [ -z "$2" ]; then
+      debug "Nameserver specified is ${FCCYN}$2${CLR}."
+      NAMESERVER=$2
+    else
+      debug "No nameserver specified."
+    fi
+
+    ZONE=$1
+    debug "Zone passed is ${FCCYN}${ZONE}${CLR}."
+
+    ZONEFILE=`${HOST} -t AXFR ${ZONE} ${NAMESERVER} 2>&1`
+    RC=$?
+    if [ ${RC} -ne 0 ]; then
+      error "Error transferring zone ${FCCYN}${ZONE}${CLR}: Error code: ${FCCYN}${RC}${CLR} (${FCCYN}${OUTPUT}${CLR})"
+      return 255
+    else
+      debug "Got zone ${FCCYN}${ZONE}${CLR}."
+      IFS=$'\n'
+      for RECORD in ${ZONEFILE}; do
+        if [[ ${RECORD} = *IN* ]]; then
+          debug "RR is ${RECORD}"
+          parse_rr "${RECORD}"
+          debug "Parsed RR name is ${FCCYN}${P_RR[0]}${CLR}, RR type is ${FCCYN}${P_RR[1]}${CLR} and data is ${FCCYN}${P_RR[2]}${CLR}."
+          P_NAME=${P_RR[0]}
+          if [[ "${P_NAME}" = "${ZONE}." ]]; then
+            debug "RR is an origin RR."
+            P_NAME="@"
+          else
+            P_NAME=`echo ${P_NAME} | sed -e "s/.${ZONE}\.$//g"`
+            debug "Removed zone from end of RR name."
+          fi
+          P_TYPE=${P_RR[1]}
+          P_DATA=${P_RR[2]}
+          case ${P_RR[1]} in
+            SOA)
+              debug "RR is an SOA record."
+                I_NAME=`echo ${P_RR[0]} | sed -e 's/\.$//g'`
+                I_AUTH=`echo ${P_RR[2]} | awk '{ print $1 }'`
+                I_CONTACT=`echo ${P_RR[2]} | awk '{ print $2 }'`
+                I_SERIAL=`echo ${P_RR[2]} | awk '{ print $3 }'`
+                I_REFRESH=`echo ${P_RR[2]} | awk '{ print $4 }'`
+                I_RETRY=`echo ${P_RR[2]} | awk '{ print $5 }'`
+                I_EXPIRY=`echo ${P_RR[2]} | awk '{ print $6 }'`
+                I_CACHE=`echo ${P_RR[2]} | awk '{ print $7 }'`
+                I_TTL=${P_RR[3]}
+                debug "Parsed SOA record has authoritative nameserver of ${FCCYN}${I_AUTH}${CLR}, contact ${FCCYN}${I_CONTACT}${CLR}, serial ${FCCYN}${I_SERIAL}${CLR}, refresh ${FCCYN}${I_REFRESH}${CLR}, retry is ${FCCYN}${I_RETRY}${CLR}, expiry ${FCCYN}${I_EXPIRY}${CLR}, cache ${FCCYN}${I_CACHE}${CLR} and TTL ${FCCYN}${I_TTL}${CLR}."
+
+                check_zone_exists ${I_NAME}
+                RC=$?
+                if [ ${RC} -eq 255 ]; then
+                  error "Error checking for ${FCCYN}${ZONE}${CLR}."
+                  return 255
+                elif [ ${RC} -eq 1 ]; then
+                  debug "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+                  add_zone ${I_NAME} 1 ${I_AUTH} ${I_CONTACT} ${I_REFRESH} ${I_RETRY} ${I_EXPIRY} ${I_CACHE} ${I_TTL}
+                  if [ $? -eq 255 ]; then
+                    error "Error adding zone ${FCCYN}${ZONE}${CLR}."
+                    return 255
+                  else
+                    debug "Added zone ${FCCYN}${ZONE}${CLR}."
+                  fi
+                else
+                  debug "Zone ${FCCYN}${ZONE}${CLR} already exists, so will update existing zone."
+                  set_zone_auth ${ZONE} ${I_AUTH}
+                  if [ $? -eq 255 ]; then
+                    error "Error setting authoritative nameserver for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${I_AUTH}${CLR}."
+                    return 255
+                  fi
+                  set_zone_contact ${ZONE} ${I_CONTACT}
+                  if [ $? -eq 255 ]; then
+                    error "Error setting contact for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${I_CONTACT}${CLR}."
+                    return 255
+                  fi
+                  update_zone_serial ${ZONE} ${I_SERIAL}
+                  if [ $? -eq 255 ]; then
+                    error "Error setting serial for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${I_SERIAL}${CLR}."
+                    return 255
+                  fi
+                  set_zone_refresh ${ZONE} ${I_REFRESH}
+                  if [ $? -eq 255 ]; then
+                    error "Error setting refresh for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${I_REFRESH}${CLR}."
+                    return 255
+                  fi
+                  set_zone_retry ${ZONE} ${I_RETRY}
+                  if [ $? -eq 255 ]; then
+                    error "Error setting retry for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${I_RETRY}${CLR}."
+                    return 255
+                  fi
+                  set_zone_expiry ${ZONE} ${I_EXPIRY}
+                  if [ $? -eq 255 ]; then
+                    error "Error setting expiry for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${I_EXPIRY}${CLR}."
+                    return 255
+                  fi
+                  set_zone_cache ${ZONE} ${I_CACHE}
+                  if [ $? -eq 255 ]; then
+                    error "Error setting cache for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${I_CACHE}${CLR}."
+                    return 255
+                  fi
+                  set_zone_ttl ${ZONE} ${I_TTL}
+                  if [ $? -eq 255 ]; then
+                    error "Error setting TTL for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${I_TTL}${CLR}."
+                    return 255
+                  fi
+                fi
+              ;;
+            A|AAAA|CNAME|NS|MX|PTR)
+              debug "RR is an ${P_TYPE} record."
+              check_rr_exists ${ZONE} ${P_TYPE} ${P_NAME} "${P_DATA}"
+              RC=$?
+              if [ ${RC} -eq 0 ]; then
+                debug "RR exists, will delete."
+                delete_rr ${ZONE} ${P_TYPE} ${P_NAME} "${P_DATA}"
+                if [ $? -eq 255 ]; then
+                  error "Error deleting RR."
+                  return 255
+                fi
+              elif [ ${RC} -eq 255 ]; then
+                error "Error checking for RR."
+                return 255
+              fi
+              add_rr ${ZONE} ${P_TYPE} ${P_NAME} ${P_DATA}
+              if [ $? -eq 255 ]; then
+                error "Error adding RR."
+                return 255
+              fi
+              ;;
+            *)
+              debug "RR unknown (${FCCYN}${P_RR[1]}${CLR})."
+              ;;
+          esac
+        fi
+      done
+    fi
+  fi
+}
+
+function parse_rr {
+  if [ -z "$1" ]; then
+    error "Missing RR argument to parse_rr."
+    return 255
+  else
+
+    RR="$1"
+    debug "Passed RR is ${FCCYN}${RR}${CLR}."
+
+    P_NAME=`echo ${RR} | awk '{ print $1 }'`
+    P_TTL=`echo ${RR} | awk '{ print $2 }'`
+    P_TYPE=`echo ${RR} | awk '{ print $4 }'`
+    P_DATA=`echo ${RR} | awk '{for (i=5; i<NF; i++) printf $i " "; print $NF}'`
+
+    P_RR=( ${P_NAME} ${P_TYPE} "${P_DATA}" ${P_TTL})
+
+    debug "Name is ${FCCYN}${P_NAME}${CLR}, type is ${FCCYN}${P_TYPE}${CLR}, TTL is ${FCCYN}${P_TTL}${CLR} and data is ${FCCYN}${P_DATA}${CLR}."
   fi
 }
 
