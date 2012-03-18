@@ -1,0 +1,1995 @@
+#!/bin/bash
+
+#------------------------------------------------------------------------------
+# bind-mgmt
+# Manage bind and zone files
+# (c) 2012 Andy Smith / northstar networks
+#------------------------------------------------------------------------------
+
+NAME="bind-mgmt"
+VERSION="0.1"
+HEADER="${NAME} ${VERSION} (c) 2012 Andy Smith / northstar networks"
+LOG=0
+DEBUG=0
+# Functions
+source ./funcs.sh
+
+DEFAULT_AUTH="ns0.infra.nsnw.co.uk"
+DEFAULT_CONTACT="support.nsnw.co.uk"
+
+DEFAULT_TTL="1h"
+DEFAULT_REFRESH="1d"
+DEFAULT_RETRY="2h"
+DEFAULT_EXPIRY="4w"
+DEFAULT_CACHE="1h"
+
+SQLITE="/usr/bin/sqlite3"
+DB="bind-mgmt.db"
+RNDC="/usr/sbin/rndc"
+
+if [ ! -f ${RNDC} ]; then
+  error "Cannot find ${FCCYN}${RNDC}${CLR}. Is bind installed?"
+  exit 255
+fi
+
+if [ ! -f ${SQLITE} ]; then
+  error "Cannot find ${FCCYN}${SQLITE}${CLR}. Is SQLite installed?"
+  exit 255
+fi
+
+function call_rndc {
+	if [ ! -z "$1" ]; then
+		OPTIONS="$1"
+		debug ${FUNCNAME} "rndc: called with '${FCYLW}${OPTIONS}${CLR}'"
+		OUTPUT=`${RNDC} ${OPTIONS} 2>&1`
+		ERR=$?
+
+		echo ${OUTPUT}
+		return ${ERR}
+	fi
+}
+
+function call_sqlite {
+	if [ ! -z "$1" ]; then
+		QUERY="$1"
+		debug ${FUNCNAME} "sqlite: called with '${FCYLW}${QUERY}${CLR}'"
+		OUTPUT=`${SQLITE} ${DB} "${QUERY}" 2>&1`
+		ERR=$?
+
+    IFS=$'\n'
+    for LINE in ${OUTPUT}; do
+		  echo ${LINE}
+    done
+		return ${ERR}
+	fi
+}
+
+function init_db {
+  INIT_SQL="CREATE TABLE records (id int primary key, zone varchar(255), type varchar(16), name varchar(255), rr varchar(255)); CREATE TABLE servers (id int primary key, ip varchar(255), master int(1)); CREATE TABLE zones (id int primary key, name varchar(255), active int(1), master int(1), auth varchar(255), contact varchar(255), serial varchar(32), ttl varchar(32), refresh varchar(32), retry varchar(32), expiry varchar(32), cache varchar(32));"
+
+  if [ -f ${DB} ]; then
+    error "Database ${FCCYN}${DB}${CLR} exists."
+    return 255
+  else
+    debug "Creating database ${FCCYN}${DB}${CLR}..."
+    OUTPUT=`call_sqlite "${INIT_SQL}"`
+    if [ $? -ne 0 ]; then
+      error "Error creating database ${FCCYN}${DB}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+      return 255
+    else
+      debug "Created database ${FCCYN}${DB}${CLR}."
+      return 0
+    fi
+  fi
+}
+
+function delete_db {
+  if [ -f ${DB} ]; then
+    debug "Deleting database ${FCCYN}${DB}${CLR}..."
+    OUTPUT=`rm -f ${DB} 2>&1`
+    if [ $? -eq 0 ]; then
+      debug "Database deleted."
+      return 0
+    else
+      error "Could not delete database: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+      return 255
+    fi
+  fi
+}
+
+function list_zones {
+	debug ${FUNCNAME} "Querying for list of zones..."
+	OUTPUT=`call_sqlite "SELECT * FROM zones"`
+
+	if [ $? -eq 0 ]; then
+		debug ${FUNCNAME} "Got list of zones."
+    for ZONE in `echo ${OUTPUT}`; do
+		  echo ${ZONE} | cut -f2 -d"|"
+    done
+    return 0
+  else
+    error "Could not get list of zones: Error code $? (${OUTPUT})."
+    return 255
+  fi
+}
+
+function list_active_zones {
+	debug ${FUNCNAME} "Querying for list of active zones..."
+	OUTPUT=`call_sqlite "SELECT * FROM zones WHERE active = 1"`
+
+  if [ $? -eq 0 ]; then
+    debug ${FUNCNAME} "Got list of zones."
+    for ZONE in `echo ${OUTPUT}`; do
+		  echo ${ZONE} | cut -f1 -d"|"
+    done
+    return 0
+  else
+    error "Could not get list of active zones: Error code $? (${OUTPUT})."
+    return 255
+  fi
+}
+
+function check_zone_exists {
+  if [ ! -z "$1" ]; then
+    ZONE=$1
+    debug ${FUNCNAME} "Querying for existence of '${FCCYN}${ZONE}${CLR}'..."
+
+    OUTPUT=`call_sqlite "SELECT COUNT(*) FROM zones WHERE name = '${ZONE}'"`
+
+    if [ $? -eq 0 ]; then
+      if [ ${OUTPUT} -eq 0 ]; then
+        debug ${FUNCNAME} "Zone '${FCCYN}${ZONE}${CLR}' does not exist."
+        return 1
+      elif [ ${OUTPUT} -eq 1 ]; then
+        debug ${FUNCNAME} "Zone '${FCCYN}${ZONE}${CLR}' exists."
+        return 0
+      else
+        error "Multiple matches for '${FCCYN}${ZONE}${CLR}': ${FCCYN}${OUTPUT}${CLR} matches found."
+        return 255
+      fi
+    else
+      error "Could not check for existence of zone '${FCCYN}${ZONE}${CLR}': Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT})."
+      return 255
+    fi
+  else
+    error "No zone name passed."
+    return 255
+  fi
+}
+
+function get_zone_id {
+  if [ -z "$1" ]; then
+    error "Missing zone for get_zone_id."
+    return 255
+  else
+    ZONE=$1
+    debug ${FUNCNAME} "Querying for zone ID for ${FCCYN}${ZONE}${CLR}..."
+
+    OUTPUT=`call_sqlite "SELECT ROWID FROM zones WHERE name = '${ZONE}'"`
+
+    if [[ ! -z ${OUTPUT} ]]; then
+      debug ${FUNCNAME} "Zone id for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${OUTPUT}${CLR}."
+      echo ${OUTPUT}
+      return 0
+    else
+      error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+      return 255
+    fi
+  fi
+}
+
+function get_zone_name {
+  if [ -z "$1" ]; then
+    error "Missing id for get_zone_name."
+    return 255
+  else
+    ID=$1
+    debug ${FUNCNAME} "Querying for zone name for ${FCCYN}${ID}${CLR}..."
+
+    OUTPUT=`call_sqlite "SELECT name FROM zones WHERE ROWID = '${ID}'"`
+
+    if [[ ! -z ${OUTPUT} ]]; then
+      debug ${FUNCNAME} "Zone name for ${FCCYN}${ID}${CLR} is ${FCCYN}${OUTPUT}${CLR}."
+      echo ${OUTPUT}
+      return 0
+    else
+      error "Zone with ID ${FCCYN}${ID}${CLR} does not exist."
+      return 255
+    fi
+  fi
+}
+
+function delete_zone {
+  if [ -z "$1" ]; then
+    error "Missing zone for delete_zone."
+    return 255
+  else
+    ZONE=$1
+
+    debug ${FUNCNAME} "Checking for existence of zone ${FCCYN}${ZONE}${CLR}..."
+    check_zone_exists ${ZONE}
+    if [ $? -eq 0 ]; then
+      debug ${FUNCNAME} "Deleting zone ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "DELETE FROM zones WHERE name = '${ZONE}'"`
+
+      if [ $? -eq 0 ]; then
+        debug ${FUNCNAME} "Deleted zone ${FCCYN}${ZONE}${CLR}."
+        return 0
+      else
+        error "Could not delete zone ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${FCCYN})."
+        return 255
+      fi
+    else
+      error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+      return 255
+    fi
+  fi
+}
+
+function add_zone {
+  if [ $# -lt 3 ]; then
+    error "Missing arguments to add_zone."
+    return 255
+  else
+    ZONE=$1
+    if [[ $2 != [0-9]* ]]; then
+      error "Active status must be 0 or 1"
+      return 255
+    else
+      if [ $2 -ne 0 ] && [ $2 -ne 1 ]; then
+        error "Active status must be 0 or 1"
+        return 255
+      else
+        if [ $2 -eq 0 ]; then
+          ACTIVEA="No"
+        else
+          ACTIVEA="Yes"
+        fi
+        ACTIVE=$2
+      fi
+    fi
+
+    if [ -z "$3" ]; then
+      warning "No authoritative nameserver specified, so using default of ${FCCYN}${DEFAULT_AUTH}${CLR}."
+      AUTH=${DEFAULT_AUTH}
+    else
+      debug ${FUNCNAME} "Authoritative nameserver specified as ${FCCYN}$3${CLR}."
+      AUTH=$3
+    fi
+
+    if [ -z "$4" ]; then
+      warning "No contact specified, so using default of ${FCCYN}${DEFAULT_CONTACT}${CLR}."
+      CONTACT=${DEFAULT_CONTACT}
+    else
+      debug ${FUNCNAME} "Contact specified as ${FCCYN}$4${CLR}."
+      CONTACT=$4
+    fi
+
+    if [ -z "$5" ]; then
+      warning "No refresh specified, so using default of ${FCCYN}${DEFAULT_REFRESH}${CLR}."
+      REFRESH=${DEFAULT_REFRESH}
+    else
+      debug ${FUNCNAME} "Refresh specified as ${FCCYN}$5${CLR}."
+      REFRESH=$5
+    fi
+
+    if [ -z "$6" ]; then
+      warning "No retry specified, so using default of ${FCCYN}${DEFAULT_RETRY}${CLR}."
+      RETRY=${DEFAULT_RETRY}
+    else
+      debug ${FUNCNAME} "Retry specified as ${FCCYN}$6${CLR}."
+      RETRY=$4
+    fi
+
+    if [ -z "$7" ]; then
+      warning "No expiry specified, so using default of ${FCCYN}${DEFAULT_EXPIRY}${CLR}."
+      EXPIRY=${DEFAULT_EXPIRY}
+    else
+      debug ${FUNCNAME} "Expiry specified as ${FCCYN}$7${CLR}."
+      EXPIRY=$7
+    fi
+
+    if [ -z "$8" ]; then
+      warning "No cache specified, so using default of ${FCCYN}${DEFAULT_CACHE}${CLR}."
+      CACHE=${DEFAULT_CACHE}
+    else
+      debug ${FUNCNAME} "Expiry specified as ${FCCYN}$8${CLR}."
+      CACHE=$8
+    fi
+
+    if [ -z "$9" ]; then
+      warning "No TTL specified, so using default of ${FCCYN}${DEFAULT_TTL}${CLR}."
+      TTL=${DEFAULT_TTL}
+    else
+      debug ${FUNCNAME} "TTL specified as ${FCCYN}$9${CLR}."
+      TTL=$9
+    fi
+
+    debug ${FUNCNAME} "Adding zone '${FCCYN}${ZONE}${CLR}' with active status of ${FCCYN}${ACTIVEA}${CLR}, authoritative nameserver of ${FCCYN}${AUTH}${CLR}, contact of ${FCCYN}${CONTACT}${CLR}, refresh of ${FCCYN}${REFRESH}${CLR}, retry of ${FCCYN}${RETRY}${CLR}, expiry of ${FCCYN}${EXPIRY}${CLR}, cache of ${FCCYN}${CACHE}${CLR} and TTL of ${FCCYN}${TTL}${CLR}..."
+    check_zone_exists ${ZONE}
+    if [ $? -eq 1 ]; then
+      debug ${FUNCNAME} "Zone does not exist, so adding..."
+      OUTPUT=`call_sqlite "INSERT INTO zones (name, active, auth, contact, refresh, retry, expiry, cache, ttl) VALUES ('${ZONE}', '${ACTIVE}', '${AUTH}', '${CONTACT}', '${REFRESH}', '${RETRY}', '${EXPIRY}', '${CACHE}', '${TTL}')"`
+
+      if [ $? -eq 0 ]; then
+        debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} added."
+        return 0
+      else
+        error "Could not add zone ${FCCYN}${ZONE}${CLR}: Error code $? (${OUTPUT})."
+        return 255
+      fi
+    else
+      error "Zone ${FCCYN}${ZONE}${CLR} already exists."
+      return 255
+    fi
+  fi
+}
+
+function get_zone_auth {
+  if [ -z "$1" ]; then
+    error "No zone specified for get_zone_auth."
+    return 255
+  else
+    ZONE=$1
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Getting authoritative nameserver for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "SELECT auth FROM zones WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error getting authoritative nameserver for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        if [ -z "${OUTPUT}" ]; then
+          warning "No authoritative nameserver set for ${FCCYN}${ZONE}${CLR}."
+          echo ${DEFAULT_AUTH}
+          return 1
+        else
+          debug ${FUNCNAME} "Authoritative nameserver for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${OUTPUT}${CLR}."
+          echo ${OUTPUT}
+          return 0
+        fi
+      fi
+    fi
+  fi
+}
+
+function get_zone_contact {
+  if [ -z "$1" ]; then
+    error "No zone specified for get_zone_contact."
+    return 255
+  else
+    ZONE=$1
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Getting contact for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "SELECT contact FROM zones WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error getting contact for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        if [ -z "${OUTPUT}" ]; then
+          warning "No contact set for ${FCCYN}${ZONE}${CLR}."
+          echo ${DEFAULT_CONTACT}
+          return 1
+        else
+          debug ${FUNCNAME} "Contact for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${OUTPUT}${CLR}."
+          echo ${OUTPUT}
+          return 0
+        fi
+      fi
+    fi
+  fi
+}
+
+function get_zone_ttl {
+  if [ -z "$1" ]; then
+    error "No zone specified for get_zone_ttl."
+    return 255
+  else
+    ZONE=$1
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Getting TTL for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "SELECT ttl FROM zones WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error getting TTL for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        if [ -z "${OUTPUT}" ]; then
+          warning "No TTL set for ${FCCYN}${ZONE}${CLR}."
+          echo ${DEFAULT_TTL}
+          return 1
+        else
+          debug ${FUNCNAME} "TTL for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${OUTPUT}${CLR}."
+          echo ${OUTPUT}
+          return 0
+        fi
+      fi
+    fi
+  fi
+}
+
+function get_zone_refresh {
+  if [ -z "$1" ]; then
+    error "No zone specified for get_zone_refresh."
+    return 255
+  else
+    ZONE=$1
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Getting refresh for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "SELECT refresh FROM zones WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error getting refresh for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        if [ -z "${OUTPUT}" ]; then
+          warning "No refresh set for ${FCCYN}${ZONE}${CLR}."
+          echo ${DEFAULT_REFRESH}
+          return 1
+        else
+          debug ${FUNCNAME} "Refresh for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${OUTPUT}${CLR}."
+          echo ${OUTPUT}
+          return 0
+        fi
+      fi
+    fi
+  fi
+}
+
+function get_zone_retry {
+  if [ -z "$1" ]; then
+    error "No zone specified for get_zone_retry."
+    return 255
+  else
+    ZONE=$1
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Getting retry for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "SELECT retry FROM zones WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error getting retry for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        if [ -z "${OUTPUT}" ]; then
+          warning "No retry set for ${FCCYN}${ZONE}${CLR}."
+          echo ${DEFAULT_RETRY}
+          return 1
+        else
+          debug ${FUNCNAME} "Retry for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${OUTPUT}${CLR}."
+          echo ${OUTPUT}
+          return 0
+        fi
+      fi
+    fi
+  fi
+}
+
+function get_zone_expiry {
+  if [ -z "$1" ]; then
+    error "No zone specified for get_zone_expiry."
+    return 255
+  else
+    ZONE=$1
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Getting expiry for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "SELECT expiry FROM zones WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error getting expiry for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        if [ -z "${OUTPUT}" ]; then
+          warning "No expiry set for ${FCCYN}${ZONE}${CLR}."
+          echo ${DEFAULT_EXPIRY}
+          return 1
+        else
+          debug ${FUNCNAME} "Expiry for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${OUTPUT}${CLR}."
+          echo ${OUTPUT}
+          return 0
+        fi
+      fi
+    fi
+  fi
+}
+
+function get_zone_cache {
+  if [ -z "$1" ]; then
+    error "No zone specified for get_zone_cache."
+    return 255
+  else
+    ZONE=$1
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Getting cache for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "SELECT cache FROM zones WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error getting cache for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        if [ -z "${OUTPUT}" ]; then
+          warning "No cache set for ${FCCYN}${ZONE}${CLR}."
+          echo ${DEFAULT_CACHE}
+          return 1
+        else
+          debug ${FUNCNAME} "Cache for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${OUTPUT}${CLR}."
+          echo ${OUTPUT}
+          return 0
+        fi
+      fi
+    fi
+  fi
+}
+
+function set_zone_auth {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments for set_zone_auth."
+    return 255
+  else
+    ZONE=$1
+    AUTH=$2
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Setting authoritative nameserver for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "UPDATE zones SET auth = '${AUTH}' WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error updating authoritative nameserver for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        debug ${FUNCNAME} "Set authoritative nameserver for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${AUTH}${CLR}."
+        return 0
+      fi
+    fi
+  fi
+}
+
+function set_zone_contact {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments for set_zone_contact."
+    return 255
+  else
+    ZONE=$1
+    CONTACT=$2
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Setting contact for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "UPDATE zones SET contact = '${CONTACT}' WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error updating contact for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        debug ${FUNCNAME} "Set contact for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${CONTACT}${CLR}."
+        return 0
+      fi
+    fi
+  fi
+}
+
+function set_zone_ttl {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments for set_zone_ttl."
+    return 255
+  else
+    ZONE=$1
+    TTL=$2
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Setting TTL for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "UPDATE zones SET ttl = '${TTL}' WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error updating TTL for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        debug ${FUNCNAME} "Set TTL for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${TTL}${CLR}."
+        return 0
+      fi
+    fi
+  fi
+}
+
+function set_zone_refresh {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments for set_zone_refresh."
+    return 255
+  else
+    ZONE=$1
+    REFRESH=$2
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Setting refresh for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "UPDATE zones SET refresh = '${REFRESH}' WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error updating refresh for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        debug ${FUNCNAME} "Set refresh for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${REFRESH}${CLR}."
+        return 0
+      fi
+    fi
+  fi
+}
+
+function set_zone_retry {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments for set_zone_retry."
+    return 255
+  else
+    ZONE=$1
+    RETRY=$2
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Setting retry for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "UPDATE zones SET retry = '${RETRY}' WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error updating retry for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        debug ${FUNCNAME} "Set retry for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${RETRY}${CLR}."
+        return 0
+      fi
+    fi
+  fi
+}
+
+function set_zone_expiry {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments for set_zone_expiry."
+    return 255
+  else
+    ZONE=$1
+    EXPIRY=$2
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Setting expiry for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "UPDATE zones SET expiry = '${EXPIRY}' WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error updating expiry for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        debug ${FUNCNAME} "Set expiry for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${EXPIRY}${CLR}."
+        return 0
+      fi
+    fi
+  fi
+}
+
+function set_zone_cache {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments for set_zone_cache."
+    return 255
+  else
+    ZONE=$1
+    CACHE=$2
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Setting cache for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "UPDATE zones SET cache = '${CACHE}' WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error updating cache for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        debug ${FUNCNAME} "Set cache for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${CACHE}${CLR}."
+        return 0
+      fi
+    fi
+  fi
+}
+
+function set_zone_auth {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments for set_zone_aith."
+    return 255
+  else
+    ZONE=$1
+    AUTH=$2
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} doesn't exist."
+      return 255
+    else
+      debug ${FUNCNAME} "Setting authoritative nameserver for ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "UPDATE zones SET auth = '${AUTH}' WHERE name = '${ZONE}'"`
+      if [ $? -ne 0 ]; then
+        error "Error updating authoritative nameserver for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        debug ${FUNCNAME} "Set authoritative nameserver for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${AUTH}${CLR}."
+        return 0
+      fi
+    fi
+  fi
+}
+
+function set_zone_master {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments to set_zone_master."
+    return 255
+  else
+    ZONE=$1
+    if [[ $2 != [0-9]* ]]; then
+      error "Master status must be 0 or 1"
+      return 255
+    else
+      if [ $2 -ne 0 ] && [ $2 -ne 1 ]; then
+        error "Master status must be 0 or 1"
+        return 255
+      else
+        if [ $2 -eq 0 ]; then
+          MASTERA="No"
+        else
+          MASTERA="Yes"
+        fi
+        MASTER=$2
+      fi
+    fi
+
+    debug ${FUNCNAME} "Setting zone '${FCCYN}${ZONE}${CLR}' to master = ${FCCYN}${MASTERA}${CLR}..."
+    OUTPUT=`call_sqlite "UPDATE zones SET master = ${MASTER} WHERE name = '${ZONE}'"`
+
+    if [ $? -eq 0 ]; then
+      debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} set to master = ${FCCYN}${MASTERA}${CLR}.";
+      return 0
+    else
+      error "Could not set zone ${FCCYN}${ZONE}${CLR} master to ${FCCYN}${MASTERA}${CLR}.";
+      return 255
+    fi
+  fi
+}
+
+function set_zone_active {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments to set_zone_active."
+    return 255
+  else
+    ZONE=$1
+    if [[ $2 != [0-9]* ]]; then
+      error "Active status must be 0 or 1"
+      return 255
+    else
+      if [ $2 -ne 0 ] && [ $2 -ne 1 ]; then
+        error "Active status must be 0 or 1"
+        return 255
+      else
+        if [ $2 -eq 0 ]; then
+          ACTIVEA="No"
+        else
+          ACTIVEA="Yes"
+        fi
+        ACTIVE=$2
+      fi
+    fi
+
+    debug ${FUNCNAME} "Setting zone '${FCCYN}${ZONE}${CLR}' to active = ${FCCYN}${ACTIVEA}${CLR}..."
+    OUTPUT=`call_sqlite "UPDATE zones SET active = ${ACTIVE} WHERE name = '${ZONE}'"`
+
+    if [ $? -eq 0 ]; then
+      debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} set to active = ${FCCYN}${ACTIVEA}${CLR}.";
+      return 0
+    else
+      error "Could not set zone ${FCCYN}${ZONE}${CLR} active to ${FCCYN}${ACTIVEA}${CLR}.";
+      return 255
+    fi
+  fi
+}
+
+function is_zone_active {
+  if [ -z "$1" ]; then
+    error "Missing zone for is_zone_active."
+    return 255
+  else
+    
+    ZONE=$1
+    debug ${FUNCNAME} "Checking for existence of zone ${FCCYN}${ZONE}${CLR}..."
+    OUTPUT=`check_zone_exists ${ZONE}`
+    if [ $? -eq 0 ]; then
+      debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} exists."
+      OUTPUT=`call_sqlite "SELECT active FROM zones WHERE name = '${ZONE}'"`
+      if [ $? -eq 0 ]; then
+        if [ ${OUTPUT} -eq 0 ]; then
+          debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} is set to ${FCCYN}inactive${CLR}."
+          return 0
+        else 
+          debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} is set to ${FCCYN}active${CLR}."
+          return 1
+        fi
+      else
+        debug ${FUNCNAME} "Error getting zone active status: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      fi
+    else
+      debug ${FUNCNAME} "Error checking for zone ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR}."
+      return 255
+    fi
+  fi
+}
+        
+function is_zone_master {
+  if [ -z "$1" ]; then
+    error "Missing zone for is_zone_master."
+    return 255
+  else
+    
+    ZONE=$1
+    debug ${FUNCNAME} "Checking for existence of zone ${FCCYN}${ZONE}${CLR}..."
+    OUTPUT=`check_zone_exists ${ZONE}`
+    if [ $? -eq 0 ]; then
+      debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} exists."
+      OUTPUT=`call_sqlite "SELECT master FROM zones WHERE name = '${ZONE}'"`
+      if [ $? -eq 0 ]; then
+        if [ ${OUTPUT} -eq 0 ]; then
+          debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} is set to ${FCCYN}slave${CLR}."
+          return 0
+        else 
+          debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} is set to ${FCCYN}master${CLR}."
+          return 1
+        fi
+      else
+        debug ${FUNCNAME} "Error getting zone master status: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      fi
+    else
+      debug ${FUNCNAME} "Error checking for zone ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR}."
+      return 255
+    fi
+  fi
+}
+
+function check_server_exists {
+  if [ -z "$1" ]; then
+    error "Missing argument to check_server_exists."
+    return 255;
+  else
+
+    IP=$1
+    debug ${FUNCNAME} "Checking for server with IP ${FCCYN}${IP}${CLR}..."
+    OUTPUT=`call_sqlite "SELECT COUNT(*) FROM servers WHERE ip = '${IP}'"`
+
+    if [ $? -eq 0 ]; then
+      if [[ ${OUTPUT} -eq 0 ]]; then
+        debug ${FUNCNAME} "No server with IP ${FCCYN}${IP}${CLR} exists."
+        return 1
+      else
+        debug ${FUNCNAME} "Server with IP ${FCCYN}${IP}${CLR} exists."
+        return 0
+      fi
+    else
+      error "Error checking for server ${FCCYN}${IP}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+      return 255
+    fi
+  fi
+}
+
+function add_server {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments to add_server."
+    return 255;
+  else
+
+    IP=$1
+    MASTER=$2
+
+    check_server_exists ${IP}
+    if [ $? -eq 0 ]; then
+      error "Server ${FCCYN}${IP}${CLR} already exists."
+      return 255
+    elif [ $? -eq 255 ]; then
+      error "Error checking for existence of server ${FCCYN}${IP}${CLR}."
+      return 255
+    elif [[ ${MASTER} != [0-1] ]]; then
+      error "Master must be 0 or 1."
+      return 255
+    else
+      debug ${FUNCNAME} "Adding server with IP of ${FCCYN}${IP}${CLR} and master status of ${FCCYN}${MASTER}${CLR}..."
+      OUTPUT=`call_sqlite "INSERT INTO servers (ip, master) VALUES ('${IP}', '${MASTER}')"`
+
+      if [ $? -eq 0 ]; then
+        debug ${FUNCNAME} "Added server with IP of ${FCCYN}${IP}${CLR} and master status of ${FCCYN}${MASTER}${CLR}."
+        return 0
+      else
+        error "Error adding server with IP of ${FCCYN}${IP}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${FCCYN})."
+        return 255
+      fi
+    fi
+  fi
+}
+
+function delete_server {
+  if [ -z "${1}" ]; then
+    error "Missing IP argument to delete_server."
+    return 255
+  else
+
+    IP=$1
+
+    check_server_exists ${IP}
+    if [ $? -eq 1 ]; then
+      error "Server ${FCCYN}${IP}${CLR} does not exist."
+      return 255
+    elif [ $? -eq 255 ]; then
+      error "Error checking for existence of server ${FCCYN}${IP}${CLR}."
+      return 255
+    else
+      debug ${FUNCNAME} "Deleting server with IP of ${FCCYN}${IP}${CLR}..."
+      OUTPUT=`call_sqlite "DELETE FROM servers WHERE ip = '${IP}'"`
+
+      if [ $? -eq 0 ]; then
+        debug ${FUNCNAME} "Server with IP of ${FCCYN}${IP}${CLR} deleted."
+        return 0
+      else
+        error "Erroring deleting server with IP of ${FCCYN}${IP}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      fi
+    fi
+  fi
+}
+
+function set_server_master {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments to set_server_master."
+    return 255
+  else
+
+    IP=$1
+    MASTER=$2
+
+    check_server_exists ${IP}
+    if [ $? -eq 1 ]; then
+      error "Server ${FCCYN}${IP}${CLR} does not exist."
+      return 255
+    elif [ $? -eq 255 ]; then
+      error "Error checking for existence of server ${FCCYN}${IP}${CLR}."
+      return 255
+    fi
+
+    if [[ ${MASTER} != [0-1] ]]; then
+      error "Master must be 0 or 1"
+      return 255
+    else
+      debug ${FUNCNAME} "Setting master status for server ${FCCYN}${IP}${CLR} to ${FCCYN}${MASTER}${CLR}..."
+      OUTPUT=`call_sqlite "UPDATE servers SET master = '${MASTER}' WHERE ip = '${IP}'"`
+
+      if [ $? -eq 0 ]; then
+        debug ${FUNCNAME} "Server ${FCCYN}${IP}${CLR} master status set to ${FCCYN}${MASTER}${CLR}."
+        return 0
+      else
+        error "Error setting ${FCCYN}${IP}${CLR} master status to ${FCCYN}${MASTER}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      fi
+    fi
+  fi
+}
+
+function check_server_master {
+  if [ -z "$1" ]; then
+    error "Missing IP argument to check_server_master."
+    return 255
+  else
+
+    IP=$1
+    check_server_exists ${IP}
+    if [ $? -eq 1 ]; then
+      error "Server ${FCCYN}${IP}${CLR} does not exist."
+      return 255
+    elif [ $? -eq 255 ]; then
+      error "Error checking for existence of server ${FCCYN}${IP}${CLR}."
+      return 255
+    fi
+
+    debug ${FUNCNAME} "Checking for server ${FCCYN}${IP}${CLR} master status..."
+    OUTPUT=`call_sqlite "SELECT master FROM servers WHERE ip = '${IP}'"`
+
+    if [ $? -eq 0 ]; then
+      debug ${FUNCNAME} "Server ${FCCYN}${IP}${CLR} master status is ${FCCYN}${OUTPUT}${CLR}."
+      return ${OUTPUT}
+    else
+      error "Could not check master status for ${FCCYN}${IP}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+      return 255
+    fi
+  fi
+}
+
+function list_servers {
+  debug ${FUNCNAME} "Querying for list of servers..."
+  OUTPUT=`call_sqlite "SELECT * FROM servers"`
+
+  if [ $? -eq 0 ]; then
+    debug ${FUNCNAME} "Got list of servers."
+    echo ${OUTPUT}
+    return 0
+  else
+    error "Error getting list of servers: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+    return 255
+  fi
+}
+
+function list_servers_masters {
+  debug ${FUNCNAME} "Querying for list of master servers..."
+  OUTPUT=`call_sqlite "SELECT ip FROM servers WHERE master = 1"`
+
+  if [ $? -eq 0 ]; then
+    debug ${FUNCNAME} "Got list of servers."
+    echo ${OUTPUT}
+    return 0
+  else
+    error "Error getting list of servers: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+    return 255
+  fi
+}
+
+function list_servers_slaves {
+  debug ${FUNCNAME} "Querying for list of slave servers..."
+  OUTPUT=`call_sqlite "SELECT ip FROM servers WHERE master = 0"`
+
+  if [ $? -eq 0 ]; then
+    debug ${FUNCNAME} "Got list of servers."
+    echo ${OUTPUT}
+    return 0
+  else
+    error "Error getting list of servers: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+    return 255
+  fi
+}
+
+function generate_bind_zone_config_all {
+  if [ -z "$1" ]; then
+    error "Master or slave not specified."
+    return 255
+  fi
+
+  MASTER=$1
+  ZONES=`list_zones`
+
+  if [[ -z ${ZONES} ]]; then
+    error "No zones configured."
+    return 255
+  else
+    debug ${FUNCNAME} "Got zones: ${FCCYN}${ZONES}${CLR}."
+  fi
+
+  if [[ ${MASTER} != [0-1] ]]; then
+    error "Master or slave must be 0 or 1."
+    return 255
+  else
+    if [ ${MASTER} -eq 0 ]; then
+      MASTERA="slave"
+    else
+      MASTERA="master"
+    fi
+    debug ${FUNCNAME} "Got master status: ${FCCYN}${MASTERA}${CLR}."
+  fi
+
+  for ZONE in ${ZONES}; do
+    debug ${FUNCNAME} "Generating ${FCCYN}${MASTERA}${CLR} zone config for ${FCCYN}${ZONE}${CLR}."
+    generate_bind_zone_config ${ZONE} ${MASTER}
+  done
+
+  debug ${FUNCNAME} "Completed bind config generation."
+  return 0
+}
+
+
+
+function generate_bind_zone_config {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments to generate_bind_zone_config."
+    return 255
+  else
+
+    ZONE=$1
+    MASTER=$2
+
+    if [[ ${MASTER} != [0-1] ]]; then
+      error "Master must be 0 or 1"
+      return 255
+    fi
+
+    check_zone_exists ${ZONE}
+    if [ $? -ne 0 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+      return 255
+    fi
+
+    debug ${FUNCNAME} "Getting list of master servers..."
+    MASTERS=`list_servers_masters`
+    if [[ -z ${MASTERS} ]]; then
+      error "No master servers configured."
+      return 255
+    else
+      debug ${FUNCNAME} "Got master servers: ${FCCYN}${MASTERS}${CLR}."
+    fi
+
+    SLAVES=`list_servers_slaves`
+    if [[ -z ${SLAVES} ]]; then
+      error "No slave servers configured."
+      return 255
+    else
+      debug ${FUNCNAME} "Got slave servers: ${FCCYN}${SLAVES}${CLR}."
+    fi
+
+    MASTER_LIST=""
+    SLAVE_LIST=""
+
+    debug ${FUNCNAME} "Generating list of master servers..."
+    for SERVER in ${MASTERS}; do
+      MASTER_LIST="${MASTER_LIST}${SERVER}; "
+    done
+
+    debug ${FUNCNAME} "Generating list of slave servers..."
+    for SERVER in ${SLAVES}; do
+      SLAVE_LIST="${SLAVE_LIST}${SERVER}; "
+    done
+
+    if [ $? -eq 0 ]; then
+      if [ ${MASTER} -eq 1 ]; then
+        echo -ne "
+zone "${ZONE}" {
+  type master;
+  file \"/etc/bind/domains/master/${ZONE}\";
+  also-notify { ${SLAVE_LIST}};
+}
+" 1>&2
+      else
+        echo -ne "
+zone "${ZONE}" {
+  type slave;
+  file \"/etc/bind/domains/slave/${ZONE}\";
+  masters { ${MASTER_LIST}};
+}
+" 1>&2
+      fi
+    else
+      error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+      return 255
+    fi
+  fi
+}
+
+function check_rr_exists {
+  if [ $# -lt 4 ]; then
+    error "Missing arguments to check_rr_exists."
+    return 255
+  else
+
+    ZONE=$1
+    TYPEI=$2
+    NAME=$3
+    RR=$4
+
+    # Uppercase the type
+    TYPE=`echo ${TYPEI} | tr [a-z] [A-Z]`
+
+    debug ${FUNCNAME} "Checking for ${FCCYN}${TYPE}${CLR} record in ${FCCYN}${ZONE}${CLR} for ${FCCYN}${NAME}${CLR} with data ${FCCYN}${RR}${CLR}..."
+    OUTPUT=`call_sqlite "SELECT COUNT(*) FROM records WHERE zone = '${ZONE}' AND type = '${TYPE}' AND name = '${NAME}' AND rr = '${RR}'"`
+    if [ $? -eq 255 ]; then
+      error "Error checking for RR: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+      return 255;
+    elif [ ${OUTPUT} -eq 0 ]; then
+      debug ${FUNCNAME} "RR does not exist."
+      return 1
+    elif [ ${OUTPUT} -eq 1 ]; then
+      debug ${FUNCNAME} "RR exists."
+      return 0
+    else
+      error "Multiple records for RR (${FCCYN}${OUTPUT}${CLR})."
+      return 255
+    fi
+  fi
+}
+
+function add_rr {
+  if [ $# -lt 4 ]; then
+    error "Missing arguments to add_rr."
+    return 255
+  else
+
+    ZONE=$1
+    shift
+    TYPEI=$1
+    shift
+    NAME=$1
+    shift
+    RR="$*"
+
+    # Check for the existence of zone
+    check_zone_exists ${ZONE}
+    if [ $? -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+      return 255
+    fi
+
+    # Uppercase the type
+    TYPE=`echo ${TYPEI} | tr [a-z] [A-Z]`
+
+    # Check for RR
+    check_rr_exists ${ZONE} ${TYPEI} ${NAME} "${RR}"
+    if [ $? -eq 0 ]; then
+      error "RR already exists."
+      return 255
+    elif [ $? -eq 255 ]; then
+      error "Error checking for existence of RR."
+      return 255
+    else
+      debug ${FUNCNAME} "RR doesn't already exist."
+      debug ${FUNCNAME} "Adding ${FCCYN}${TYPE}${CLR} record in ${FCCYN}${ZONE}${CLR} for ${FCCYN}${NAME}${CLR} with data ${FCCYN}${RR}${CLR}..."
+
+      OUTPUT=`call_sqlite "INSERT INTO records (zone, type, name, rr) VALUES ('${ZONE}', '${TYPE}', '${NAME}', '${RR}')"`
+      if [ $? -eq 0 ]; then
+        debug ${FUNCNAME} "RR added."
+        return 0
+      else
+        error "Error adding RR: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      fi
+    fi
+  fi
+}
+
+function delete_rr {
+  if [ $# -lt 4 ]; then
+    error "Missing arguments to delete_rr."
+    return 255
+  else
+
+    ZONE=$1
+    shift
+    TYPEI=$1
+    shift
+    NAME=$1
+    shift
+    RR="$*"
+
+    # Uppercase the type
+    TYPE=`echo ${TYPEI} | tr [a-z] [A-Z]`
+
+    # Check for RR
+    check_rr_exists ${ZONE} ${TYPEI} ${NAME} "${RR}"
+    if [ $? -eq 1 ]; then
+      error "RR does not exist."
+      return 255
+    elif [ $? -eq 255 ]; then
+      error "Error checking for existence of RR."
+      return 255
+    else
+      debug ${FUNCNAME} "RR exists."
+      debug ${FUNCNAME} "Deleting ${FCCYN}${TYPE}${CLR} record in ${FCCYN}${ZONE}${CLR} for ${FCCYN}${NAME}${CLR} with data ${FCCYN}${RR}${CLR}..."
+
+      OUTPUT=`call_sqlite "DELETE FROM records WHERE zone = '${ZONE}' AND type = '${TYPE}' AND name = '${NAME}' AND rr = '${RR}'"`
+      if [ $? -eq 0 ]; then
+        debug ${FUNCNAME} "RR deleted."
+        return 0
+      else
+        error "Error deleting RR: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      fi
+    fi
+  fi
+}
+
+function get_zone_rrs {
+  if [ -z "$1" ]; then
+    error "Missing zone argument for get_zone_rr."
+    return 255
+  else
+    
+    ZONE=$1
+    check_zone_exists ${ZONE}
+
+    if [ $? -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+      return 255
+    elif [ $? -eq 255 ]; then
+      error "Error querying for existence of zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    else
+
+      OUTPUT=`call_sqlite "SELECT * FROM records WHERE zone = '${ZONE}' AND name != '@'"`
+
+      if [ $? -ne 0 ]; then
+        error "Error querying for RRs for ${FCCYN}${ZONE}${CLR}: Error code: ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        IFS=$'\n'
+        for RR in ${OUTPUT}; do
+          RR_TYPE=`echo ${RR} | cut -f3 -d"|"`
+          RR_NAME=`echo ${RR} | cut -f4 -d"|"`
+          RR_DATA=`echo ${RR} | cut -f5 -d"|"`
+          debug ${FUNCNAME} "Got RR of type ${FCCYN}${RR_TYPE}${CLR} with name ${FCCYN}${RR_NAME}${CLR} and data ${FCCYN}${RR_DATA}${CLR}."
+          debug ${FUNCNAME} "Raw RR data: ${FCCYN}${RR}${CLR}."
+          echo -e "${RR_NAME}\t\tIN\t${RR_TYPE}\t${RR_DATA}"
+        done
+      fi
+    fi
+  fi
+}
+
+function get_zone_origin_rrs {
+  if [ -z "$1" ]; then
+    error "Missing zone argument for get_zone_origin_rrs."
+    return 255
+  else
+    
+    ZONE=$1
+    check_zone_exists ${ZONE}
+
+    if [ $? -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+      return 255
+    elif [ $? -eq 255 ]; then
+      error "Error querying for existence of zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    else
+
+      OUTPUT=`call_sqlite "SELECT * FROM records WHERE zone = '${ZONE}' AND name = '@'"`
+
+      if [ $? -ne 0 ]; then
+        error "Error querying for origin RRs for ${FCCYN}${ZONE}${CLR}: Error code: ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        IFS=$'\n'
+        for RR in ${OUTPUT}; do
+          RR_TYPE=`echo ${RR} | cut -f3 -d"|"`
+          RR_NAME=`echo ${RR} | cut -f4 -d"|"`
+          RR_DATA=`echo ${RR} | cut -f5 -d"|"`
+          debug ${FUNCNAME} "Got RR of type ${FCCYN}${RR_TYPE}${CLR} with name ${FCCYN}${RR_NAME}${CLR} and data ${FCCYN}${RR_DATA}${CLR}."
+          debug ${FUNCNAME} "Raw RR data: ${FCCYN}${RR}${CLR}."
+          echo -e "${RR_NAME}\t\t\tIN\t${RR_TYPE}\t${RR_DATA}"
+        done
+      fi
+    fi
+  fi
+}
+
+function get_zone_serial {
+  if [ -z "$1" ]; then
+    error "Missing zone argument for get_zone_serial."
+    return 255
+  else
+
+    ZONE=$1
+    check_zone_exists ${ZONE}
+
+    if [ $? -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+      return 255
+    elif [ $? -eq 255 ]; then
+      error "Error querying for existence of zone ${FCCYN}${ZONE}${CLR}."
+      return 255
+    else
+      
+      OUTPUT=`call_sqlite "SELECT serial FROM zones WHERE name = '${ZONE}'"`
+
+      if [ $? -ne 0 ]; then
+        error "Error querying serial number for ${FCCYN}${ZONE}${CLR}: Error code: ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+        return 255
+      else
+        if [ -z "${OUTPUT}" ]; then
+          warning "Zone ${FCCYN}${ZONE}${CLR} does not have a serial number."
+          return 1
+        else
+          debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} has serial number ${FCCYN}${OUTPUT}${CLR}."
+          echo ${OUTPUT}
+          return 0
+        fi
+      fi
+    fi
+  fi
+}
+
+function generate_zone_serial {
+  if [ -z "$1" ]; then
+    error "Missing zone argument for generate_zone_serial."
+    return 255
+  else
+    
+    DATESTAMP=`date +"%Y%m%d"`
+    debug ${FUNCNAME} "Datestamp is ${FCCYN}${DATESTAMP}${CLR}."
+
+    ZONE=$1
+    SERIAL=`get_zone_serial ${ZONE}`
+
+    if [ $? -eq 255 ]; then
+      error "Error getting serial for ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ -z "${SERIAL}" ]; then
+      debug ${FUNCNAME} "No current serial for ${FCCYN}${ZONE}${CLR}."
+      SERIAL="${DATESTAMP}01"
+      debug ${FUNCNAME} "Generated serial for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${SERIAL}${CLR}."
+      echo ${SERIAL}
+      return 0
+    else
+      debug ${FUNCNAME} "Current serial for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${SERIAL}${CLR}."
+      OLD_DATESTAMP=`echo ${SERIAL} | cut -c1-8`
+      debug ${FUNCNAME} "Current datestamp for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${OLD_DATESTAMP}${CLR}."
+      if [ "${OLD_DATESTAMP}" != "${DATESTAMP}" ]; then
+        debug ${FUNCNAME} "Current datestamp is different to today's datestamp."
+        SERIAL="${DATESTAMP}01"
+        debug ${FUNCNAME} "Generated serial for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${SERIAL}${CLR}."
+        echo ${SERIAL}
+        return 0
+      else
+        debug ${FUNCNAME} "Current datestamp is today's."
+        NO=`echo ${SERIAL} | cut -c9-10`
+        debug ${FUNCNAME} "Current number if ${FCCYN}${NO}${CLR}."
+        NEW_NO=`expr ${NO} + 1`
+        SERIAL="${DATESTAMP}`printf \"%02d\" ${NEW_NO}`"
+        debug ${FUNCNAME} "Generated serial for ${FCCYN}${ZONE}${CLR} is ${FCCYN}${SERIAL}${CLR}."
+        echo ${SERIAL}
+        return 0
+      fi
+    fi
+  fi
+}
+
+function update_zone_serial {
+  if [ $# -lt 2 ]; then
+    error "Missing arguments for update_zone_serial."
+    return 255
+  else
+
+    ZONE=$1
+    SERIAL=$2
+
+    check_zone_exists ${ZONE}
+    if [ $? -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+      return 255
+    elif [ $? -eq 255 ]; then
+      error "Error checking for existence of ${FCCYN}${ZONE}${CLR}."
+      return 255
+    else
+      if [[ "${SERIAL}" != [0-9]* ]]; then
+        error "Serial must be numeric."
+        return 255
+      else
+        debug ${FUNCNAME} "Updating serial for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${SERIAL}${CLR}..."
+        OUTPUT=`call_sqlite "UPDATE zones SET serial = '${SERIAL}' WHERE name = '${ZONE}'"`
+
+        if [ $? -ne 0 ]; then
+          error "Error updating serial for ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${CLR})."
+          return 255
+        else
+          debug ${FUNCNAME} "Updated serial for ${FCCYN}${ZONE}${CLR} to ${FCCYN}${SERIAL}${CLR}."
+          return 0
+        fi
+      fi
+    fi
+  fi
+}
+
+function generate_zone {
+  if [ -z "$1" ]; then
+    error "Missing zone argument for generate_zone."
+    return 255
+  else
+
+    ZONE=$1
+    check_zone_exists ${ZONE}
+    if [ $? -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+      return 255
+    elif [ $? -eq 255 ]; then
+      error "Error checking for existence of ${FCCYN}${ZONE}${CLR}."
+      return 255
+    else
+      # Generate SOA record
+      AUTH=`get_zone_auth ${ZONE}`
+      if [ $? -eq 255 ]; then
+        error "Error getting authoritative nameserver for ${FCCYN}${ZONE}${CLR}."
+        return 255
+      fi
+      CONTACT=`get_zone_contact ${ZONE}`
+      if [ $? -eq 255 ]; then
+        error "Error getting contact for ${FCCYN}${ZONE}${CLR}."
+        return 255
+      fi
+      REFRESH=`get_zone_refresh ${ZONE}`
+      if [ $? -eq 255 ]; then
+        error "Error getting refresh for ${FCCYN}${ZONE}${CLR}."
+        return 255
+      fi
+      RETRY=`get_zone_retry ${ZONE}`
+      if [ $? -eq 255 ]; then
+        error "Error getting retry for ${FCCYN}${ZONE}${CLR}."
+        return 255
+      fi
+      EXPIRY=`get_zone_expiry ${ZONE}`
+      if [ $? -eq 255 ]; then
+        error "Error getting expiry for ${FCCYN}${ZONE}${CLR}."
+        return 255
+      fi
+      CACHE=`get_zone_cache ${ZONE}`
+      if [ $? -eq 255 ]; then
+        error "Error getting cache for ${FCCYN}${ZONE}${CLR}."
+        return 255
+      fi
+      TTL=`get_zone_ttl ${ZONE}`
+      if [ $? -eq 255 ]; then
+        error "Error getting TTL for ${FCCYN}${ZONE}${CLR}."
+        return 255
+      fi
+      SERIAL=`generate_zone_serial ${ZONE}`
+      if [ $? -eq 255 ]; then
+        error "Error generating serial for ${FCCYN}${ZONE}${CLR}."
+        return 255
+      else
+        debug ${FUNCNAME} "Saving serial ${FCCYN}${SERIAL}${CLR} for ${FCCYN}${ZONE}${CLR}..."
+        update_zone_serial ${ZONE} ${SERIAL}
+      fi
+
+      echo -e "
+\$ORIGIN ${ZONE}.
+\$TTL ${TTL}
+${ZONE}.\t\tIN\tSOA\t${AUTH}. ${CONTACT}. (
+\t\t\t${SERIAL}
+\t\t\t${REFRESH}
+\t\t\t${RETRY}
+\t\t\t${EXPIRY}
+\t\t\t${CACHE}
+\t\t\t)\n" 1>&2
+
+      echo "; Origin records" 1>&2
+      # Get origin RRs
+      OUTPUT=`get_zone_origin_rrs ${ZONE}`
+      if [ $? -eq 255 ]; then
+        error "Error getting origin RRs."
+        return 255
+      else
+        IFS=$'\n'
+        for RR in ${OUTPUT}; do
+          echo ${RR} 1>&2
+        done
+      fi
+
+      echo "; Records" 1>&2
+      # Get RRs
+      OUTPUT=`get_zone_rrs ${ZONE}`
+      if [ $? -eq 255 ]; then
+        error "Error getting RRs."
+        return 255
+      else
+        IFS=$'\n'
+        for RR in ${OUTPUT}; do
+          echo ${RR} 1>&2
+        done
+      fi
+
+    fi
+  fi
+}
+
+function print_list_zones {
+  ZONES=`list_zones`
+
+  debug ${FUNCNAME} "Printing list of zones..."
+  IFS=$'\n'
+  for ZONE in ${ZONES}; do
+    echo ${ZONE}
+  done
+}
+
+function print_zone_details {
+  if [ -z "$1" ]; then
+    error "Missing zone argument to print_zone_details."
+    return 255
+  else
+    ZONE=$1
+    check_zone_exists ${ZONE}
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error checking for existence of ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
+      return 255
+    fi
+    
+    AUTH=`get_zone_auth ${ZONE}`
+    if [ $? -eq 255 ]; then
+      error "Error getting authoritative nameserver for ${FCCYN}${ZONE}${CLR}."
+      return 255
+    fi
+    CONTACT=`get_zone_contact ${ZONE}`
+    if [ $? -eq 255 ]; then
+      error "Error getting contact for ${FCCYN}${ZONE}${CLR}."
+      return 255
+    fi
+    REFRESH=`get_zone_refresh ${ZONE}`
+    if [ $? -eq 255 ]; then
+      error "Error getting refresh for ${FCCYN}${ZONE}${CLR}."
+      return 255
+    fi
+    RETRY=`get_zone_retry ${ZONE}`
+    if [ $? -eq 255 ]; then
+      error "Error getting retry for ${FCCYN}${ZONE}${CLR}."
+      return 255
+    fi
+    EXPIRY=`get_zone_expiry ${ZONE}`
+    if [ $? -eq 255 ]; then
+      error "Error getting expiry for ${FCCYN}${ZONE}${CLR}."
+      return 255
+    fi
+    CACHE=`get_zone_cache ${ZONE}`
+    if [ $? -eq 255 ]; then
+      error "Error getting cache for ${FCCYN}${ZONE}${CLR}."
+      return 255
+    fi
+    TTL=`get_zone_ttl ${ZONE}`
+    if [ $? -eq 255 ]; then
+      error "Error getting TTL for ${FCCYN}${ZONE}${CLR}."
+      return 255
+    fi
+    SERIAL=`get_zone_serial ${ZONE}`
+    RC=$?
+    if [ ${RC} -eq 255 ]; then
+      error "Error generating serial for ${FCCYN}${ZONE}${CLR}."
+      return 255
+    elif [ ${RC} -eq 1 ]; then
+      warning "No serial for ${FCCYN}${ZONE}${CLR}."
+      SERIAL=`generate_zone_serial ${ZONE}`
+      debug ${FUNCNAME} "Saving serial ${FCCYN}${SERIAL}${CLR} for ${FCCYN}${ZONE}${CLR}..."
+      update_zone_serial ${ZONE} ${SERIAL}
+    fi
+
+    echo "
+Details for '${ZONE}':-
+
+Contact:                  ${CONTACT}
+Serial:                   ${SERIAL}
+Authoritative nameserver: ${AUTH}
+Slave refresh:            ${REFRESH}
+Slave retry:              ${RETRY}
+Slave expiry:             ${EXPIRY}
+Maximum caching time:     ${CACHE}
+Default TTL:              ${TTL}
+"
+    
+    return 0
+  fi
+}
+
+function run_command {
+  case $1 in
+    list-zones)
+      print_list_zones
+      ;;
+    zone-details)
+      if [ -z ${S_ZONE} ]; then
+        error "${FCGRN}zone-details${CLR} requires a zone name (using ${FCGRN}-z${CLR})."
+        exit 1
+      else
+        check_zone_exists ${S_ZONE}
+        RC=$?
+        if [ ${RC} -eq 255 ]; then
+          error "Error checking for ${FCCYN}${S_ZONE}${CLR}."
+          exit 255
+        elif [ ${RC} -eq 1 ]; then
+          error "Zone ${FCCYN}${S_ZONE}${CLR} does not exist."
+          exit 1
+        fi
+        print_zone_details ${S_ZONE}
+      fi
+      ;;
+    add-rr)
+      if [ -z ${S_ZONE} ]; then
+        error "${FCGRN}add-rr${CLR} requires a zone name (using ${FCGRN}-z${CLR})."
+        exit 1
+      fi
+      if [ -z ${S_TYPE} ]; then
+        error "${FCGRN}add-rr${CLR} requires an RR type (using ${FCGRN}-t${CLR})."
+        exit 1
+      fi
+      if [ -z ${S_NAME} ]; then
+        error "${FCGRN}add-rr${CLR} requires a name (using ${FCGRN}-n${CLR})."
+        exit 1
+      fi
+      if [ -z "${S_DATA}" ]; then
+        error "${FCGRN}add-rr${CLR} requires data (using ${FCGRN}-r${CLR})."
+        exit 1
+      fi
+      check_zone_exists ${S_ZONE}
+      RC=$?
+      if [ ${RC} -eq 255 ]; then
+        error "Error checking for ${FCCYN}${S_ZONE}${CLR}."
+        exit 255
+      elif [ ${RC} -eq 1 ]; then
+        error "Zone ${FCCYN}${S_ZONE}${CLR} does not exist."
+        exit 1
+      fi
+      add_rr ${S_ZONE} ${S_TYPE} ${S_NAME} ${S_DATA}
+      if [ $? -eq 255 ]; then
+        error "Error adding RR."
+        exit 255
+      fi
+      ;;
+    add-zone)
+      if [ -z ${S_ZONE} ]; then
+        error "${FCGRN}add-zone${CLR} requires a zone name (using ${FCGRN}-z${CLR})."
+        exit 1
+      fi
+      if [ -z ${S_AUTH} ]; then
+        warning "No authoritative nameserver specified. Using default of ${FCCYN}${DEFAULT_AUTH}${CLR}."
+        AUTH=${DEFAULT_AUTH}
+      else
+        debug ${FUNCNAME} "Authoritative nameserver specified is ${FCCYN}${S_AUTH}${CLR}."
+        AUTH=${S_AUTH}
+      fi
+      if [ -z ${S_CONTACT} ]; then
+        warning "No contact specified. Using default of ${FCCYN}${DEFAULT_CONTACT}${CLR}."
+        CONTACT=${DEFAULT_CONACT}
+      else
+        debug ${FUNCNAME} "Contact specified is ${FCCYN}${S_CONTACT}${CLR}."
+        CONTACT=${S_CONTACT}
+      fi
+      if [ -z ${S_REFRESH} ]; then
+        warning "No zone refresh specified. Using default of ${FCCYN}${DEFAULT_REFRESH}${CLR}."
+        AUTH=${DEFAULT_REFRESH}
+      else
+        debug ${FUNCNAME} "Zone refresh specified is ${FCCYN}${S_REFRESH}${CLR}."
+        REFRESH=${S_REFRESH}
+      fi
+      if [ -z ${S_RETRY} ]; then
+        warning "No zone retry specified. Using default of ${FCCYN}${DEFAULT_RETRY}${CLR}."
+        RETRY=${DEFAULT_RETRY}
+      else
+        debug ${FUNCNAME} "Zone retry specified is ${FCCYN}${S_RETRY}${CLR}."
+        RETRY=${S_RETRY}
+      fi
+      if [ -z ${S_EXPIRY} ]; then
+        warning "No zone expiry specified. Using default of ${FCCYN}${DEFAULT_EXPIRY}${CLR}."
+        EXPIRY=${DEFAULT_EXPIRY}
+      else
+        debug ${FUNCNAME} "Zone expiry specified is ${FCCYN}${S_EXPIRY}${CLR}."
+        EXPIRY=${S_EXPIRY}
+      fi
+      if [ -z ${S_TTL} ]; then
+        warning "No TTL specified. Using default of ${FCCYN}${DEFAULT_TTL}${CLR}."
+        TTL=${DEFAULT_TTL}
+      else
+        debug ${FUNCNAME} "TTL specified is ${FCCYN}${S_TTL}${CLR}."
+        TTL=${S_TTL}
+      fi
+
+      ZONE=${S_ZONE}
+      check_zone_exists ${ZONE}
+      RC=$?
+      if [ ${RC} -eq 255 ]; then
+        error "Error checking for existence of ${FCCYN}${ZONE}${CLR}."
+        exit 255
+      elif [ ${RC} -eq 0 ]; then
+        error "Zone ${FCCYN}${ZONE}${CLR} exists."
+        exit 1
+      fi
+
+      debug ${FUNCNAME} "Adding zone ${FCCYN}${ZONE}${CLR}..."
+      add_zone ${ZONE} 1 ${AUTH} ${CONTACT} ${REFRESH} ${RETRY} ${EXPIRY} ${CACHE} ${TTL}
+      RC=$?
+      if [ ${RC} -eq 255 ]; then
+        error "Error adding zone ${FCCYN}${ZONE}${CLR}."
+        exit 255
+      fi
+      debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} added."
+      ;;
+    *)
+      echo "Unknown command."
+      show_help
+      exit 1
+      ;;
+  esac
+}
+
+function show_help {
+  echo ${HEADER}
+  echo "
+Manage bind and zone files.
+
+  list-zones        List all zones
+  zone-details      Print details for <zone>
+  add-rr            Add RR
+"
+}
+
+# Main
+
+while getopts "hdx:z:e:t:n:r:a:f:y:p:c:l:w:" opt; do
+	case ${opt} in
+		d)
+			DEBUG=1
+			NOTICE=1
+			debug ${FUNCNAME} "Option -d (debug) specified."
+			;;
+    x)
+      debug ${FUNCNAME} "Option -x (function execute mode) specified."
+      debug ${FUNCNAME} "Calling ${FCCYN}${OPTARG}${CLR}..."
+      RC=`$OPTARG`
+      echo -e $RC 1>&2
+      ;;
+    z)
+      debug ${FUNCNAME} "Option -z (zone) specified."
+      debug ${FUNCNAME} "Zone specified is ${FCCYN}${OPTARG}${CLR}."
+      S_ZONE=${OPTARG}
+      ;;
+    t)
+      debug ${FUNCNAME} "Option -t (RR type) specified."
+      debug ${FUNCNAME} "RR type specified is ${FCCYN}${OPTARG}${CLR}."
+      S_TYPE=${OPTARG}
+      ;;
+    n)
+      debug ${FUNCNAME} "Option -n (RR name) specified."
+      debug ${FUNCNAME} "RR name specified is ${FCCYN}${OPTARG}${CLR}."
+      S_NAME=${OPTARG}
+      ;;
+    r)
+      debug ${FUNCNAME} "Option -r (RR data) specified."
+      debug ${FUNCNAME} "RR data specified is ${FCCYN}${OPTARG}${CLR}."
+      S_DATA=${OPTARG}
+      ;;
+    f)
+      debug ${FUNCNAME} "Option -f (zone slave refresh) specified."
+      debug ${FUNCNAME} "Slave refresh specified is ${FCCYN}${OPTARG}${CLR}."
+      S_REFRESH=${OPTARG}
+      ;;
+    y)
+      debug ${FUNCNAME} "Option -y (zone slave retry) specified."
+      debug ${FUNCNAME} "Slave retry specified is ${FCCYN}${OPTARG}${CLR}."
+      S_RETRY=${OPTARG}
+      ;;
+    p)
+      debug ${FUNCNAME} "Option -p (zone slave expiry) specified."
+      debug ${FUNCNAME} "Slave expiry specified is ${FCCYN}${OPTARG}${CLR}."
+      S_EXPIRY=${OPTARG}
+      ;;
+    r)
+      debug ${FUNCNAME} "Option -c (zone caching) specified."
+      debug ${FUNCNAME} "Zone caching specified is ${FCCYN}${OPTARG}${CLR}."
+      S_CACHE=${OPTARG}
+      ;;
+    l)
+      debug ${FUNCNAME} "Option -l (zone TTL) specified."
+      debug ${FUNCNAME} "Zone TTL specified is ${FCCYN}${OPTARG}${CLR}."
+      S_TTL=${OPTARG}
+      ;;
+    a)
+      debug ${FUNCNAME} "Option -a (authoritative nameserver) specified."
+      debug ${FUNCNAME} "Authoritative nameserver specified is ${FCCYN}${OPTARG}${CLR}."
+      S_AUTH=${OPTARG}
+      ;;
+    w)
+      debug ${FUNCNAME} "Option -w (zone contact) specified."
+      debug ${FUNCNAME} "Zone contact specified is ${FCCYN}${OPTARG}${CLR}."
+      S_CONTACT=${OPTARG}
+      ;;
+    e)
+      debug ${FUNCNAME} "Option -e (execute command) specified."
+      if [ -z ${OPTARG} ]; then
+        error "${FCGRN}-e${CLR} needs an argument."
+        exit 1
+      fi
+      debug ${FUNCNAME} "Command is ${FCCYN}${OPTARG}${CLR}."
+      RUN_COMMAND=${OPTARG}
+      ;;
+    h)
+      show_help
+      exit 0
+      ;;
+	esac
+done
+
+if [ ! -f ${DB} ]; then
+  notice "Database ${FCCYN}${DB}${CLR} does not exist. Creating..."
+  init_db
+  if [ $? -ne 0 ]; then
+    error "Error creating database."
+    exit 255
+  fi
+fi
+
+if [ -z "$1" ]; then
+  show_help
+  exit 1
+fi
+
+if [ ! -z "${RUN_COMMAND}" ]; then
+  run_command "${RUN_COMMAND}"
+fi
