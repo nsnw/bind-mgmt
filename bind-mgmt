@@ -1711,7 +1711,7 @@ function import_zone {
     return 255
   else
 
-    if [ -z "$2" ]; then
+    if [ ! -z "$2" ]; then
       debug "Nameserver specified is ${FCCYN}$2${CLR}."
       NAMESERVER=$2
     else
@@ -1979,6 +1979,28 @@ function run_command {
         print_zone_details ${S_ZONE}
       fi
       ;;
+    import-zone)
+      if [ -z "${S_ZONE}" ]; then
+        error "${FCGRN}import-zone${CLR} requires a zone name (using ${FCGRN}-b${CLR})."
+        exit 1
+      fi
+
+      if [ ! -z "${S_NAMESERVER}" ]; then
+        debug "Nameserver specified as ${FCCYN}${S_NAMESERVER}${CLR}."
+        import_zone ${S_ZONE} ${S_NAMESERVER}
+        RC=$?
+      else
+        import_zone ${S_ZONE}
+        RC=$?
+      fi
+
+      if [ ${RC} -ne 0 ]; then
+        error "Error importing zone ${FCCYN}${S_ZONE}${CLR}."
+        exit ${RC}
+      else
+        debug "Zone ${FCCYN}${S_ZONE}${CLR} imported."
+      fi
+      ;;
     add-rr)
       if [ -z ${S_ZONE} ]; then
         error "${FCGRN}add-rr${CLR} requires a zone name (using ${FCGRN}-z${CLR})."
@@ -2100,7 +2122,7 @@ Manage bind and zone files.
 
 # Main
 
-while getopts "hdx:z:e:t:n:r:a:f:y:p:c:l:w:" opt; do
+while getopts "hdx:z:e:t:n:r:a:f:y:p:c:l:w:b:" opt; do
 	case ${opt} in
 		d)
 			DEBUG=1
@@ -2167,6 +2189,11 @@ while getopts "hdx:z:e:t:n:r:a:f:y:p:c:l:w:" opt; do
       debug ${FUNCNAME} "Option -w (zone contact) specified."
       debug ${FUNCNAME} "Zone contact specified is ${FCCYN}${OPTARG}${CLR}."
       S_CONTACT=${OPTARG}
+      ;;
+    b)
+      debug ${FUNCNAME} "Option -b (nameserver) specified."
+      debug ${FUNCNAME} "Nameserver specified is ${FCCYN}${OPTARG}${CLR}."
+      S_NAMESERVER=${OPTARG}
       ;;
     e)
       debug ${FUNCNAME} "Option -e (execute command) specified."
