@@ -292,7 +292,7 @@ function add_zone {
       RETRY=${DEFAULT_RETRY}
     else
       debug ${FUNCNAME} "Retry specified as ${FCCYN}$6${CLR}."
-      RETRY=$4
+      RETRY=$6
     fi
 
     if [ -z "$7" ]; then
