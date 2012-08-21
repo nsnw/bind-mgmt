@@ -1242,7 +1242,7 @@ zone "${ZONE}" {
   type master;
   file \"/etc/bind/domains/master/${ZONE}\";
   also-notify { ${SLAVE_LIST}};
-}
+};
 " 1>&2
       else
         echo -ne "
@@ -1250,7 +1250,7 @@ zone "${ZONE}" {
   type slave;
   file \"/etc/bind/domains/slave/${ZONE}\";
   masters { ${MASTER_LIST}};
-}
+};
 " 1>&2
       fi
     else
