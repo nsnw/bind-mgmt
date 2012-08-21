@@ -2123,12 +2123,12 @@ Manage bind and zone files.
 # Main
 
 while getopts "hdx:z:e:t:n:r:a:f:y:p:c:l:w:b:" opt; do
-	case ${opt} in
-		d)
-			DEBUG=1
-			NOTICE=1
-			debug ${FUNCNAME} "Option -d (debug) specified."
-			;;
+  case ${opt} in
+    d)
+      DEBUG=1
+      NOTICE=1
+      debug ${FUNCNAME} "Option -d (debug) specified."
+      ;;
     x)
       debug ${FUNCNAME} "Option -x (function execute mode) specified."
       debug ${FUNCNAME} "Calling ${FCCYN}${OPTARG}${CLR}..."
@@ -2170,7 +2170,7 @@ while getopts "hdx:z:e:t:n:r:a:f:y:p:c:l:w:b:" opt; do
       debug ${FUNCNAME} "Slave expiry specified is ${FCCYN}${OPTARG}${CLR}."
       S_EXPIRY=${OPTARG}
       ;;
-    r)
+    c)
       debug ${FUNCNAME} "Option -c (zone caching) specified."
       debug ${FUNCNAME} "Zone caching specified is ${FCCYN}${OPTARG}${CLR}."
       S_CACHE=${OPTARG}
