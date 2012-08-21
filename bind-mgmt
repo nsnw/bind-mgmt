@@ -2054,7 +2054,7 @@ function run_command {
       fi
       if [ -z ${S_REFRESH} ]; then
         warning "No zone refresh specified. Using default of ${FCCYN}${DEFAULT_REFRESH}${CLR}."
-        AUTH=${DEFAULT_REFRESH}
+        REFRESH=${DEFAULT_REFRESH}
       else
         debug ${FUNCNAME} "Zone refresh specified is ${FCCYN}${S_REFRESH}${CLR}."
         REFRESH=${S_REFRESH}
