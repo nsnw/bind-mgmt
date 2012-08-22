@@ -40,30 +40,30 @@ if [ ! -f ${SQLITE} ]; then
 fi
 
 function call_rndc {
-	if [ ! -z "$1" ]; then
-		OPTIONS="$1"
-		debug ${FUNCNAME} "rndc: called with '${FCYLW}${OPTIONS}${CLR}'"
-		OUTPUT=`${RNDC} ${OPTIONS} 2>&1`
-		ERR=$?
+  if [ ! -z "$1" ]; then
+    OPTIONS="$1"
+    debug ${FUNCNAME} "rndc: called with '${FCYLW}${OPTIONS}${CLR}'"
+    OUTPUT=`${RNDC} ${OPTIONS} 2>&1`
+    ERR=$?
 
-		echo ${OUTPUT}
-		return ${ERR}
-	fi
+    echo ${OUTPUT}
+    return ${ERR}
+  fi
 }
 
 function call_sqlite {
-	if [ ! -z "$1" ]; then
-		QUERY="$1"
-		debug ${FUNCNAME} "sqlite: called with '${FCYLW}${QUERY}${CLR}'"
-		OUTPUT=`${SQLITE} ${DB} "${QUERY}" 2>&1`
-		ERR=$?
+  if [ ! -z "$1" ]; then
+    QUERY="$1"
+    debug ${FUNCNAME} "sqlite: called with '${FCYLW}${QUERY}${CLR}'"
+    OUTPUT=`${SQLITE} ${DB} "${QUERY}" 2>&1`
+    ERR=$?
 
     IFS=$'\n'
     for LINE in ${OUTPUT}; do
-		  echo ${LINE}
+      echo ${LINE}
     done
-		return ${ERR}
-	fi
+    return ${ERR}
+  fi
 }
 
 function call_sipcalc {
@@ -112,13 +112,13 @@ function delete_db {
 }
 
 function list_zones {
-	debug ${FUNCNAME} "Querying for list of zones..."
-	OUTPUT=`call_sqlite "SELECT * FROM zones"`
+  debug ${FUNCNAME} "Querying for list of zones..."
+  OUTPUT=`call_sqlite "SELECT * FROM zones"`
 
-	if [ $? -eq 0 ]; then
-		debug ${FUNCNAME} "Got list of zones."
+  if [ $? -eq 0 ]; then
+    debug ${FUNCNAME} "Got list of zones."
     for ZONE in `echo ${OUTPUT}`; do
-		  echo ${ZONE} | cut -f2 -d"|"
+      echo ${ZONE} | cut -f2 -d"|"
     done
     return 0
   else
@@ -128,13 +128,13 @@ function list_zones {
 }
 
 function list_active_zones {
-	debug ${FUNCNAME} "Querying for list of active zones..."
-	OUTPUT=`call_sqlite "SELECT * FROM zones WHERE active = 1"`
+  debug ${FUNCNAME} "Querying for list of active zones..."
+  OUTPUT=`call_sqlite "SELECT * FROM zones WHERE active = 1"`
 
   if [ $? -eq 0 ]; then
     debug ${FUNCNAME} "Got list of zones."
     for ZONE in `echo ${OUTPUT}`; do
-		  echo ${ZONE} | cut -f1 -d"|"
+      echo ${ZONE} | cut -f1 -d"|"
     done
     return 0
   else
@@ -292,7 +292,7 @@ function add_zone {
       RETRY=${DEFAULT_RETRY}
     else
       debug ${FUNCNAME} "Retry specified as ${FCCYN}$6${CLR}."
-      RETRY=$4
+      RETRY=$6
     fi
 
     if [ -z "$7" ]; then
@@ -1242,7 +1242,7 @@ zone "${ZONE}" {
   type master;
   file \"/etc/bind/domains/master/${ZONE}\";
   also-notify { ${SLAVE_LIST}};
-}
+};
 " 1>&2
       else
         echo -ne "
@@ -1250,7 +1250,7 @@ zone "${ZONE}" {
   type slave;
   file \"/etc/bind/domains/slave/${ZONE}\";
   masters { ${MASTER_LIST}};
-}
+};
 " 1>&2
       fi
     else
@@ -2054,7 +2054,7 @@ function run_command {
       fi
       if [ -z ${S_REFRESH} ]; then
         warning "No zone refresh specified. Using default of ${FCCYN}${DEFAULT_REFRESH}${CLR}."
-        AUTH=${DEFAULT_REFRESH}
+        REFRESH=${DEFAULT_REFRESH}
       else
         debug ${FUNCNAME} "Zone refresh specified is ${FCCYN}${S_REFRESH}${CLR}."
         REFRESH=${S_REFRESH}
@@ -2123,12 +2123,12 @@ Manage bind and zone files.
 # Main
 
 while getopts "hdx:z:e:t:n:r:a:f:y:p:c:l:w:b:" opt; do
-	case ${opt} in
-		d)
-			DEBUG=1
-			NOTICE=1
-			debug ${FUNCNAME} "Option -d (debug) specified."
-			;;
+  case ${opt} in
+    d)
+      DEBUG=1
+      NOTICE=1
+      debug ${FUNCNAME} "Option -d (debug) specified."
+      ;;
     x)
       debug ${FUNCNAME} "Option -x (function execute mode) specified."
       debug ${FUNCNAME} "Calling ${FCCYN}${OPTARG}${CLR}..."
@@ -2170,7 +2170,7 @@ while getopts "hdx:z:e:t:n:r:a:f:y:p:c:l:w:b:" opt; do
       debug ${FUNCNAME} "Slave expiry specified is ${FCCYN}${OPTARG}${CLR}."
       S_EXPIRY=${OPTARG}
       ;;
-    r)
+    c)
       debug ${FUNCNAME} "Option -c (zone caching) specified."
       debug ${FUNCNAME} "Zone caching specified is ${FCCYN}${OPTARG}${CLR}."
       S_CACHE=${OPTARG}
@@ -2208,7 +2208,7 @@ while getopts "hdx:z:e:t:n:r:a:f:y:p:c:l:w:b:" opt; do
       show_help
       exit 0
       ;;
-	esac
+  esac
 done
 
 if [ ! -f ${DB} ]; then
