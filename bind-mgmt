@@ -228,9 +228,18 @@ function delete_zone {
 
       if [ $? -eq 0 ]; then
         debug ${FUNCNAME} "Deleted zone ${FCCYN}${ZONE}${CLR}."
-        return 0
       else
         error "Could not delete zone ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${FCCYN})."
+        return 255
+      fi
+      
+      debug ${FUNCNAME} "Deleting zone records ${FCCYN}${ZONE}${CLR}..."
+      OUTPUT=`call_sqlite "DELETE FROM records WHERE zone = '${ZONE}'"`
+      if [ $? -eq 0 ]; then
+        debug ${FUNCNAME} "Deleted zone records ${FCCYN}${ZONE}${CLR}."
+        return 0
+      else
+        error "Could not delete zone records ${FCCYN}${ZONE}${CLR}: Error code ${FCCYN}$?${CLR} (${FCCYN}${OUTPUT}${FCCYN})."
         return 255
       fi
     else
