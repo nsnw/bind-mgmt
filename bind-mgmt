@@ -1247,20 +1247,20 @@ function generate_bind_zone_config {
     if [ $? -eq 0 ]; then
       if [ ${MASTER} -eq 1 ]; then
         echo -ne "
-zone "${ZONE}" {
+zone \"${ZONE}\" {
   type master;
   file \"/etc/bind/domains/master/${ZONE}\";
   also-notify { ${SLAVE_LIST}};
 };
-" 1>&2
+"
       else
         echo -ne "
-zone "${ZONE}" {
+zone \"${ZONE}\" {
   type slave;
   file \"/etc/bind/domains/slave/${ZONE}\";
   masters { ${MASTER_LIST}};
 };
-" 1>&2
+" 
       fi
     else
       error "Zone ${FCCYN}${ZONE}${CLR} does not exist."
@@ -1650,9 +1650,9 @@ ${ZONE}.\t\tIN\tSOA\t${AUTH} ${CONTACT} (
 \t\t\t${RETRY}
 \t\t\t${EXPIRY}
 \t\t\t${CACHE}
-\t\t\t)\n" 1>&2
+\t\t\t)\n"
 
-      echo "; Origin records" 1>&2
+      echo "; Origin records"
       # Get origin RRs
       OUTPUT=`get_zone_origin_rrs ${ZONE}`
       if [ $? -eq 255 ]; then
@@ -1661,11 +1661,11 @@ ${ZONE}.\t\tIN\tSOA\t${AUTH} ${CONTACT} (
       else
         IFS=$'\n'
         for RR in ${OUTPUT}; do
-          echo ${RR} 1>&2
+          echo ${RR}
         done
       fi
 
-      echo "; Records" 1>&2
+      echo "; Records" 
       # Get RRs
       OUTPUT=`get_zone_rrs ${ZONE}`
       if [ $? -eq 255 ]; then
@@ -1674,7 +1674,7 @@ ${ZONE}.\t\tIN\tSOA\t${AUTH} ${CONTACT} (
       else
         IFS=$'\n'
         for RR in ${OUTPUT}; do
-          echo ${RR} 1>&2
+          echo ${RR} 
         done
       fi
 
@@ -2110,6 +2110,24 @@ function run_command {
       fi
       debug ${FUNCNAME} "Zone ${FCCYN}${ZONE}${CLR} added."
       ;;
+    gen-zones-conf)
+      G_ZONE=`generate_bind_zone_config_all 1`
+      IFS=$'\n'
+      for i in $G_ZONE; do
+        echo $i
+      done
+      ;;
+    gen-zone-file)
+      if [ -z ${S_ZONE} ]; then
+        error "${FCGRN}add-zone${CLR} requires a zone name (using ${FCGRN}-z${CLR})."
+        exit 1
+      fi
+      G_ZONE=`generate_zone ${S_ZONE}`
+      IFS=$'\n'
+      for i in $G_ZONE; do
+        echo $i
+      done
+      ;;
     *)
       echo "Unknown command."
       show_help
@@ -2126,6 +2144,8 @@ Manage bind and zone files.
   list-zones        List all zones
   zone-details      Print details for <zone>
   add-rr            Add RR
+  gen-zone-file     Gen zone configuration
+  gen-zones-conf    Gen zone files
 "
 }
 
@@ -2237,3 +2257,4 @@ fi
 if [ ! -z "${RUN_COMMAND}" ]; then
   run_command "${RUN_COMMAND}"
 fi
+
