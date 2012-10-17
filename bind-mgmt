@@ -1420,7 +1420,11 @@ function get_zone_rrs {
           RR_DATA=`echo ${RR} | cut -f5 -d"|"`
           debug ${FUNCNAME} "Got RR of type ${FCCYN}${RR_TYPE}${CLR} with name ${FCCYN}${RR_NAME}${CLR} and data ${FCCYN}${RR_DATA}${CLR}."
           debug ${FUNCNAME} "Raw RR data: ${FCCYN}${RR}${CLR}."
-          echo -e "${RR_NAME}\t\tIN\t${RR_TYPE}\t${RR_DATA}"
+          if [ "$RR_TYPE" == "TXT" ]; then
+            echo -e "${RR_NAME}\t\tIN\t${RR_TYPE}\t\"${RR_DATA}\""
+          else
+            echo -e "${RR_NAME}\t\tIN\t${RR_TYPE}\t${RR_DATA}"
+          fi
         done
       fi
     fi
